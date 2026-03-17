@@ -122,7 +122,28 @@ def load_ply_numpy(model_name, max_splats, align=True, flip=True):
     if max_splats is None:
         max_splats = 500
 
-    url = f"http://localhost:8000/models/{model_name}/point_cloud/iteration_30000/point_cloud.ply"
+    try:
+        import js
+        # Stlite runs Pyodide in a Web Worker where 'window' is unavailable; fallback to 'self'
+        if hasattr(js, "window"):
+            loc = js.window.location
+        else:
+            loc = js.self.location
+            
+        pathname = loc.pathname
+        # Strip worker paths (like /stlite_assets/) or handle blob URLs to get the true root
+        if getattr(loc, "protocol", "") == "blob:":
+            base_path = ""
+        elif 'stlite_assets' in pathname:
+            base_path = pathname.split('stlite_assets')[0].rstrip('/')
+        else:
+            base_path = pathname.rsplit('/', 1)[0] if pathname.endswith('.html') else pathname.rstrip('/')
+            
+        base_url = f"{loc.origin}{base_path}"
+    except Exception:
+        base_url = "http://localhost:8000"
+
+    url = f"{base_url}/models/{model_name}/point_cloud/iteration_30000/point_cloud.ply"
     
     theta_params, colors = load_ply(
         url,
