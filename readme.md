@@ -2,6 +2,9 @@
 
 Pure NumPy implementation of convex D-optimal active view selection for 3D Gaussian Splatting. Optimizes for geometric accuracy rather than photometric quality.
 
+## Live Demo
+https://203b.pt0.me/demo.html
+
 ## Quick Start
 
 ```bash
