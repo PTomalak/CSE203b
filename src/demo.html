@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+    <title>Geometric Active View Selection Demo</title>
+    <style>
+      body { margin: 0; padding: 0; }
+      #root { width: 100vw; height: 100vh; }
+    </style>
+  </head>
+  <body>
+    <!-- The stlite container -->
+    <div id="root"></div>
+
+    <!-- Import stlite -->
+    <script src="stlite_assets/stlite.js"></script>
+    <script>
+      Promise.all([
+        fetch('demo.py').then(res => res.text()),
+        fetch('fast_solver.py').then(res => res.text()),
+        fetch('align.py').then(res => res.text()),
+        fetch('loader.py').then(res => res.text())
+      ])
+      .then(([demoCode, fastSolverCode, alignCode, loaderCode]) => {
+          stlite.mount(
+            {
+              requirements: ["numpy", "scipy", "plotly"],
+              entrypoint: "demo.py",
+              files: {
+                "fast_solver.py": fastSolverCode,
+                "align.py": alignCode,
+                "loader.py": loaderCode,
+                "demo.py": demoCode
+              }
+            },
+            document.getElementById("root")
+          );
+        })
+        .catch(err => console.error("Could not load Python assets", err));
+    </script>
+  </body>
+</html>

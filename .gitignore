@@ -1,0 +1,12 @@
+src/models
+*.aux
+*.log
+*.out
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.zip
+*.png
+src/__pycache__
+src/stlite_assets
+src/test_out
