@@ -6,7 +6,10 @@ alignment, normalization, and color extraction logic.
 """
 
 import numpy as np
-from src.align import align_object_to_z_up
+try:
+    from align import align_object_to_z_up
+except ImportError:
+    from src.align import align_object_to_z_up
 
 
 def parse_ply_vertices(vertex_data):
