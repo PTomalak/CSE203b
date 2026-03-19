@@ -1,33 +1,39 @@
 """
-run_experiment.py — Benchmark D-optimal view selection with all fixes.
+run_experiment.py — Benchmark D-optimal view selection and integrality-gap behavior.
 
 Methods tested:
   - random (averaged over 10 draws)
   - uniform (evenly spaced)
   - greedy_nbv (sequential greedy, FisherRF/OUGS baseline)
   - doptimal_topK (FW relaxation + naive top-K rounding)
-  - doptimal_swap (FW relaxation + swap local search)          ← NEW
-  - doptimal_randomized (FW relaxation + randomized rounding)  ← NEW
-  - doptimal_pipage (FW relaxation + pipage rounding)          ← NEW
+  - doptimal_swap (FW relaxation + swap local search)
+  - doptimal_randomized (FW relaxation + randomized rounding)
+  - doptimal_pipage (FW relaxation + pipage rounding)
 
 Outputs:
-  results.json — all results, convergence data, weight vectors
+  results.json
+  integrality_gap_vs_scene_size.png
+  integrality_gap_boxplot_by_rounding.png
 """
 
-import numpy as np
-import time
 import json
 import os
-from src.loader import load_ply, normalize_theta_params
+import time
+
+import matplotlib.pyplot as plt
+import numpy as np
+from src.loader import load_ply
 from src.fast_solver import (
-    generate_cameras_numpy,
     compute_fisher_information_numpy,
-    solve_d_optimal_frank_wolfe_numpy,
+    continuous_relaxed_objective,
+    discrete_subset_objective,
+    integrality_gap_percent,
     load_real_cameras,
-    round_topK,
-    round_swap_local_search,
-    round_randomized_best_of_N,
     round_pipage,
+    round_randomized_best_of_N,
+    round_swap_local_search,
+    round_topK,
+    solve_d_optimal_frank_wolfe_numpy,
 )
 
 SCENES = {
@@ -45,10 +51,11 @@ SCENES = {
     "room":      "data/360_v2/room",
     "stump":     "data/360_v2/stump",
 }
-PLY_ROOT   = "src/models"
+PLY_ROOT = "src/models"
 NUM_SPLATS = 1000
-K_VALUES   = [5, 10, 20]
-REPEATS    = 10
+K_VALUES = [5, 10, 20]
+REPEATS = 10
+PLOT_TOPK_K = 10
 
 METHODS = [
     "random",
@@ -59,6 +66,47 @@ METHODS = [
     "doptimal_randomized",
     "doptimal_pipage",
 ]
+ROUNDING_METHODS = [
+    "doptimal_topK",
+    "doptimal_swap",
+    "doptimal_randomized",
+    "doptimal_pipage",
+]
+
+
+def find_latest_ply_path(ply_root, scene_name):
+    base = os.path.join(ply_root, scene_name, "point_cloud")
+    if not os.path.isdir(base):
+        return None, None
+
+    candidates = []
+    for dirname in os.listdir(base):
+        if not dirname.startswith("iteration_"):
+            continue
+        try:
+            iteration = int(dirname.split("_")[1])
+        except (IndexError, ValueError):
+            continue
+        ply_path = os.path.join(base, dirname, "point_cloud.ply")
+        if os.path.exists(ply_path):
+            candidates.append((iteration, ply_path))
+
+    if not candidates:
+        return None, None
+
+    candidates.sort(reverse=True)
+    return candidates[0][1], candidates[0][0]
+
+
+def count_ply_vertices(ply_path):
+    with open(ply_path, "rb") as f:
+        for raw_line in f:
+            line = raw_line.decode("utf-8", errors="ignore").strip()
+            if line.startswith("element vertex"):
+                return int(line.split()[-1])
+            if line == "end_header":
+                break
+    return None
 
 
 # ── baselines ────────────────────────────────────────────────────────────────
@@ -66,16 +114,18 @@ METHODS = [
 def select_random(M, K):
     return np.random.choice(M, K, replace=False).tolist()
 
+
 def select_uniform(M, K):
     step = max(1, M // K)
     return list(range(0, M, step))[:K]
+
 
 def select_greedy_nbv(F_blocks, K, lam):
     """Greedy NBV with shared lambda."""
     M, N, _, _ = F_blocks.shape
     selected = []
     M_inv = (1.0 / lam) * np.eye(10)[np.newaxis].repeat(N, axis=0)
-    for k in range(K):
+    for _ in range(K):
         best_j, best_gain = -1, -np.inf
         for j in range(M):
             if j in selected:
@@ -101,10 +151,62 @@ def logdet_score(F_blocks, indices, lam):
     M_w = F_subset.sum(axis=0) + lam * np.eye(10)
     return float(np.sum(np.linalg.slogdet(M_w)[1]))
 
+
 def compute_shared_lambda(F_blocks, frac=1e-2):
     frob_norms = np.sqrt(np.einsum('mnab, mnab -> mn', F_blocks, F_blocks))
     mean_norm = np.mean(frob_norms[frob_norms > 0]) if np.any(frob_norms > 0) else 1.0
     return frac * mean_norm
+
+
+def save_integrality_gap_figures(results, scene_meta, output_dir="."):
+    scatter_rows = []
+    boxplot_data = {method: [] for method in ROUNDING_METHODS}
+
+    for entry in results.values():
+        if entry["method"] not in ROUNDING_METHODS:
+            continue
+        if "integrality_gap_pct" not in entry:
+            continue
+        boxplot_data[entry["method"]].append(entry["integrality_gap_pct"])
+        if entry["method"] == "doptimal_topK" and entry["K"] == PLOT_TOPK_K:
+            scatter_rows.append((
+                scene_meta[entry["scene"]]["scene_complexity"],
+                entry["integrality_gap_pct"],
+                entry["scene"],
+            ))
+
+    if scatter_rows:
+        scatter_rows.sort(key=lambda x: x[0])
+        xs = [r[0] for r in scatter_rows]
+        ys = [r[1] for r in scatter_rows]
+        labels = [r[2] for r in scatter_rows]
+
+        plt.figure(figsize=(7.5, 4.8), dpi=180)
+        plt.scatter(xs, ys)
+        for x, y, label in zip(xs, ys, labels):
+            plt.annotate(label, (x, y), fontsize=8, xytext=(4, 3), textcoords="offset points")
+        if len(xs) >= 2 and np.std(xs) > 0:
+            coeffs = np.polyfit(xs, ys, 1)
+            xfit = np.linspace(min(xs), max(xs), 100)
+            yfit = coeffs[0] * xfit + coeffs[1]
+            plt.plot(xfit, yfit, linestyle="--")
+        plt.xlabel("Scene complexity (original splat count)")
+        plt.ylabel("Integrality gap (%)")
+        plt.title(f"Integrality gap vs scene size (Top-K, K={PLOT_TOPK_K})")
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "integrality_gap_vs_scene_size.png"))
+        plt.close()
+
+    non_empty_methods = [m for m, vals in boxplot_data.items() if vals]
+    if non_empty_methods:
+        plt.figure(figsize=(7.8, 4.8), dpi=180)
+        plt.boxplot([boxplot_data[m] for m in non_empty_methods], labels=non_empty_methods, showmeans=True)
+        plt.ylabel("Integrality gap (%)")
+        plt.title("Integrality gap by rounding method")
+        plt.xticks(rotation=15)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "integrality_gap_boxplot_by_rounding.png"))
+        plt.close()
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -113,30 +215,37 @@ results = {}
 scene_meta = {}
 
 for scene_name, scene_dir in SCENES.items():
-    ply_path = os.path.join(PLY_ROOT, scene_name,
-                            "point_cloud/iteration_30000/point_cloud.ply")
-    if not os.path.exists(ply_path):
-        print(f"[SKIP] {scene_name} — .ply not found at {ply_path}")
+    ply_path, iteration = find_latest_ply_path(PLY_ROOT, scene_name)
+    if ply_path is None:
+        print(f"[SKIP] {scene_name} — no point_cloud.ply found under {os.path.join(PLY_ROOT, scene_name)}")
         continue
 
-    print(f"\n{'='*70}\n  Scene: {scene_name}\n{'='*70}")
+    print(f"\n{'='*70}\n  Scene: {scene_name} (iteration {iteration})\n{'='*70}")
 
     np.random.seed(42)
+    original_num_splats = count_ply_vertices(ply_path)
     theta, _ = load_ply(ply_path, max_splats=NUM_SPLATS, align=False, flip=False)
-    cameras  = load_real_cameras(scene_dir)
 
-    # Scale theta to camera coordinate range
+    # Load cameras from the same model directory as the checkpoint when available.
+    # This supports exported GS model layouts that contain cameras.json but not sparse/0/*.bin.
+    model_scene_dir = os.path.join(PLY_ROOT, scene_name)
+
+    try:
+        cameras = load_real_cameras(model_scene_dir)
+    except FileNotFoundError:
+        # Fallback to dataset directory if full COLMAP metadata exists there.
+        cameras = load_real_cameras(scene_dir)
+
     cam_positions = np.array([-c['R'].T @ c['t'] for c in cameras])
-    cam_scale   = np.percentile(np.abs(cam_positions), 95)
+    cam_scale = np.percentile(np.abs(cam_positions), 95)
     theta_scale = np.percentile(np.abs(theta[:, :3]), 95)
     ratio = cam_scale / theta_scale
     theta[:, 0:3] *= ratio
     theta[:, 3:6] += np.log(ratio)
 
     M = len(cameras)
-    print(f"  {M} real cameras, {theta.shape[0]} splats")
+    print(f"  {M} real cameras, {theta.shape[0]} sampled splats, original={original_num_splats}")
 
-    # Compute Fisher (with normalized outputs)
     print("  Computing Fisher blocks (normalized outputs)...")
     t0 = time.time()
     F_blocks = compute_fisher_information_numpy(theta, cameras, normalize_outputs=True)
@@ -148,7 +257,10 @@ for scene_name, scene_dir in SCENES.items():
 
     scene_meta[scene_name] = {
         "num_cameras": M,
-        "num_splats": theta.shape[0],
+        "num_splats": int(theta.shape[0]),
+        "original_num_splats": int(original_num_splats) if original_num_splats is not None else None,
+        "scene_complexity": int(original_num_splats) if original_num_splats is not None else int(theta.shape[0]),
+        "iteration": int(iteration),
         "fisher_time": fisher_time,
         "shared_lambda": shared_lam,
     }
@@ -228,13 +340,11 @@ for scene_name, scene_dir in SCENES.items():
                     raise ValueError(f"Unknown rounding: {rounding_name}")
                 round_time = time.time() - t0
 
-                # Continuous relaxation objective
-                N_splats = F_blocks.shape[1]
-                M_w_cont = np.einsum('m, mnab -> nab', w_star, F_blocks) \
-                         + shared_lam * np.expand_dims(np.eye(10), 0)
-                relaxed_obj = float(-np.sum(np.linalg.slogdet(M_w_cont)[1]))
+                relaxed_obj = continuous_relaxed_objective(F_blocks, w_star, shared_lam)
+                discrete_obj = discrete_subset_objective(F_blocks, idx, shared_lam)
+                score = -discrete_obj
+                gap_pct = integrality_gap_percent(relaxed_obj, discrete_obj)
 
-                score = logdet_score(F_blocks, idx, shared_lam)
                 entry = {
                     "scene": scene_name, "method": method, "K": K,
                     "logdet": score,
@@ -244,10 +354,11 @@ for scene_name, scene_dir in SCENES.items():
                     "selected": idx,
                     "fw_iters": len(gap_history),
                     "relaxed_obj": relaxed_obj,
-                    "discrete_obj": float(-score),
+                    "discrete_obj": discrete_obj,
+                    "integrality_gap_pct": gap_pct,
+                    "scene_complexity": scene_meta[scene_name]["scene_complexity"],
                 }
                 if rounding_name == "topK":
-                    # Store convergence data and weights once
                     entry["fw_gap_history"] = [float(g) for g in gap_history]
                     entry["w_star"] = [float(w) for w in w_star]
 
@@ -258,13 +369,12 @@ for scene_name, scene_dir in SCENES.items():
                   f"  sel={entry['selected'][:5]}...")
 
 
-# ── save ─────────────────────────────────────────────────────────────────────
-
 output = {
     "config": {
         "ply_root": PLY_ROOT, "num_splats": NUM_SPLATS,
         "k_values": K_VALUES, "methods": METHODS, "repeats": REPEATS,
         "normalize_outputs": True, "use_line_search": True,
+        "plot_topk_k": PLOT_TOPK_K,
     },
     "scene_meta": scene_meta,
     "results": results,
@@ -273,3 +383,6 @@ output = {
 with open("results.json", "w") as f:
     json.dump(output, f, indent=2)
 print(f"\nSaved results.json ({len(results)} entries across {len(scene_meta)} scenes)")
+
+save_integrality_gap_figures(results, scene_meta, output_dir=".")
+print("Saved integrality-gap figures.")

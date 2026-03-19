@@ -2,6 +2,7 @@ import numpy as np
 import time
 import struct
 import os
+import json
 
 # 1/sigma^2: inverse noise variance on projected geometric quantities.
 # The Fisher information is F = (1/sigma^2) * J^T J  (see Eq. 1 in the paper).
@@ -115,25 +116,40 @@ def quat_to_rotmat(qw, qx, qy, qz):
     return R
 
 def load_real_cameras(scene_dir):
+    """
+    Load real cameras from either:
+      1. COLMAP sparse/0/{images.bin,cameras.bin}
+      2. cameras.json fallback
+    """
     sparse_dir = os.path.join(scene_dir, "sparse", "0")
     images_bin = os.path.join(sparse_dir, "images.bin")
     cameras_bin = os.path.join(sparse_dir, "cameras.bin")
-    
-    images = read_colmap_images_bin(images_bin)
-    cam_map = read_colmap_cameras_bin(cameras_bin)
-    result = []
-    for img in images:
-        intr = cam_map[img["camera_id"]]
-        result.append({
-            "R": img["R"],
-            "t": img["t"],
-            "fx": intr["fx"],
-            "fy": intr["fy"],
-            "cx": intr["cx"],
-            "cy": intr["cy"],
-            "name": img["name"],
-        })
-    return result
+    cameras_json = os.path.join(scene_dir, "cameras.json")
+
+    if os.path.exists(images_bin) and os.path.exists(cameras_bin):
+        images = read_colmap_images_bin(images_bin)
+        cam_map = read_colmap_cameras_bin(cameras_bin)
+        result = []
+        for img in images:
+            intr = cam_map[img["camera_id"]]
+            result.append({
+                "R": img["R"],
+                "t": img["t"],
+                "fx": intr["fx"],
+                "fy": intr["fy"],
+                "cx": intr["cx"],
+                "cy": intr["cy"],
+                "name": img["name"],
+            })
+        return result
+
+    if os.path.exists(cameras_json):
+        return load_cameras_json(cameras_json)
+
+    raise FileNotFoundError(
+        f"No camera metadata found in {scene_dir}. "
+        f"Expected either sparse/0/images.bin + cameras.bin or cameras.json"
+    )
 
 def project_gaussian_batched(theta_N, R_c, t_c, fx, fy, cx, cy):
     mu = theta_N[:, 0:3]
@@ -404,6 +420,32 @@ def solve_d_optimal_frank_wolfe_numpy(F_blocks, K, max_iter=200, lambda_reg=None
         progress_callback(1.0, f"Converged in {t+1} iters | Gap: {gap:.6f}")
     return w, history_gap
 
+
+
+def continuous_relaxed_objective(F_blocks, w, lambda_reg):
+    """Return the minimization objective -log det(M(w))."""
+    I_expand = lambda_reg * np.eye(10)
+    M_w = np.einsum('m, mnab -> nab', w, F_blocks) + I_expand
+    return float(-np.sum(np.linalg.slogdet(M_w)[1]))
+
+
+def discrete_subset_objective(F_blocks, indices, lambda_reg):
+    """Return the discrete minimization objective -log det(M(S))."""
+    I_expand = lambda_reg * np.eye(10)
+    M_w = F_blocks[indices].sum(axis=0) + I_expand
+    return float(-np.sum(np.linalg.slogdet(M_w)[1]))
+
+
+def integrality_gap_percent(relaxed_obj, discrete_obj):
+    """
+    Empirical integrality-gap percentage for the minimization objective.
+
+    Since the convex relaxation is a lower bound, this should be >= 0 up to
+    numerical tolerance.
+    """
+    denom = max(abs(relaxed_obj), 1e-12)
+    return 100.0 * (discrete_obj - relaxed_obj) / denom
+
 def round_topK(w, K):
     """Baseline: pick K cameras with largest w_j."""
     return np.argsort(w)[-K:].tolist()
@@ -600,3 +642,56 @@ def solve_and_round(F_blocks, K, rounding='swap', max_iter=200, lambda_reg=None,
         raise ValueError(f"Unknown rounding: {rounding}")
     
     return indices, w_star, history, lambda_reg
+
+def load_cameras_json(path):
+    """
+    Load cameras from a Gaussian Splatting-style cameras.json file.
+
+    Expected keys typically include:
+      - rotation or R
+      - position or T / translation
+      - fx, fy, cx, cy
+    """
+    with open(path, "r") as f:
+        data = json.load(f)
+
+    cameras = []
+
+    for cam in data:
+        # Rotation
+        if "rotation" in cam:
+            R = np.array(cam["rotation"], dtype=float)
+        elif "R" in cam:
+            R = np.array(cam["R"], dtype=float)
+        else:
+            raise ValueError(f"Camera entry missing rotation/R keys: {cam.keys()}")
+
+        # Translation / position handling
+        if "position" in cam:
+            pos = np.array(cam["position"], dtype=float)
+            t = -R @ pos
+        elif "t" in cam:
+            t = np.array(cam["t"], dtype=float)
+        elif "translation" in cam:
+            t = np.array(cam["translation"], dtype=float)
+        elif "T" in cam:
+            t = np.array(cam["T"], dtype=float)
+        else:
+            raise ValueError(f"Camera entry missing position/t/translation/T keys: {cam.keys()}")
+
+        fx = float(cam.get("fx", 800.0))
+        fy = float(cam.get("fy", 800.0))
+        cx = float(cam.get("cx", 400.0))
+        cy = float(cam.get("cy", 400.0))
+
+        cameras.append({
+            "R": R,
+            "t": t,
+            "fx": fx,
+            "fy": fy,
+            "cx": cx,
+            "cy": cy,
+            "name": cam.get("img_name", cam.get("image_name", "unknown")),
+        })
+
+    return cameras
